@@ -1,5 +1,5 @@
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { gemini } from '../services/geminiService';
 import { decodeBase64, decodeAudioData, createPcmBlob } from '../services/audioUtils';
 
@@ -17,15 +17,14 @@ const LiveInterface: React.FC<LiveInterfaceProps> = ({ systemInstruction }) => {
   const [useEphemeral, setUseEphemeral] = useState(true);
   const [status, setStatus] = useState<'IDLE' | 'PROVISIONING' | 'CONNECTING' | 'LIVE'>('IDLE');
   
-  // Resumption state
   const [resumptionHandle, setResumptionHandle] = useState<string | null>(null);
   const [timeLeft, setTimeLeft] = useState<string | null>(null);
   const [tokenInfo, setTokenInfo] = useState<{ name: string, expiresAt: Date } | null>(null);
   const [tokenTimeRemaining, setTokenTimeRemaining] = useState<number>(0);
 
-  // Transcriptions state
   const [transcriptions, setTranscriptions] = useState<{ role: 'user' | 'model' | 'tool', text: string }[]>([]);
   const [currentThoughts, setCurrentThoughts] = useState<string>("");
+  const [micLevel, setMicLevel] = useState(0);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -36,6 +35,7 @@ const LiveInterface: React.FC<LiveInterfaceProps> = ({ systemInstruction }) => {
   const sourcesSetRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const frameIntervalRef = useRef<number | null>(null);
   const transcriptScrollRef = useRef<HTMLDivElement>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
 
   useEffect(() => {
     if (transcriptScrollRef.current) {
@@ -43,7 +43,6 @@ const LiveInterface: React.FC<LiveInterfaceProps> = ({ systemInstruction }) => {
     }
   }, [transcriptions, currentThoughts]);
 
-  // Token countdown timer
   useEffect(() => {
     if (!tokenInfo) return;
     const interval = setInterval(() => {
@@ -56,6 +55,43 @@ const LiveInterface: React.FC<LiveInterfaceProps> = ({ systemInstruction }) => {
     }, 1000);
     return () => clearInterval(interval);
   }, [tokenInfo, isActive]);
+
+  const stopSession = useCallback(() => {
+    if (sessionRef.current) {
+      sessionRef.current.close();
+      sessionRef.current = null;
+    }
+    
+    if (frameIntervalRef.current) {
+      window.clearInterval(frameIntervalRef.current);
+      frameIntervalRef.current = null;
+    }
+
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach(t => t.stop());
+      micStreamRef.current = null;
+    }
+
+    if (videoRef.current?.srcObject) {
+      (videoRef.current.srcObject as MediaStream).getTracks().forEach(t => t.stop());
+      videoRef.current.srcObject = null;
+    }
+
+    sourcesSetRef.current.forEach(s => {
+      try { s.stop(); } catch (e) {}
+    });
+    sourcesSetRef.current.clear();
+
+    audioContextInRef.current?.close();
+    audioContextOutRef.current?.close();
+    audioContextInRef.current = null;
+    audioContextOutRef.current = null;
+    
+    setIsActive(false);
+    setIsCameraOn(false);
+    setStatus('IDLE');
+    setMicLevel(0);
+  }, [isActive]);
 
   const startSession = async () => {
     let authToken = "";
@@ -83,12 +119,10 @@ const LiveInterface: React.FC<LiveInterfaceProps> = ({ systemInstruction }) => {
       setCurrentThoughts("");
     }
     
-    if (!audioContextInRef.current) {
-      audioContextInRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
-    }
-    if (!audioContextOutRef.current) {
-      audioContextOutRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-    }
+    const contextIn = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+    const contextOut = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+    audioContextInRef.current = contextIn;
+    audioContextOutRef.current = contextOut;
     nextStartTimeRef.current = 0;
 
     const sessionPromise = gemini.connectLive({
@@ -98,21 +132,31 @@ const LiveInterface: React.FC<LiveInterfaceProps> = ({ systemInstruction }) => {
         
         try {
           const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          const source = audioContextInRef.current!.createMediaStreamSource(stream);
-          const scriptProcessor = audioContextInRef.current!.createScriptProcessor(4096, 1, 1);
+          micStreamRef.current = stream;
+          const source = contextIn.createMediaStreamSource(stream);
+          const scriptProcessor = contextIn.createScriptProcessor(4096, 1, 1);
           
           scriptProcessor.onaudioprocess = (e) => {
             if (isMuted || !isActive) return;
             const inputData = e.inputBuffer.getChannelData(0);
+            
+            // Calculate mic level for UI feedback
+            let sum = 0;
+            for (let i = 0; i < inputData.length; i++) sum += inputData[i] * inputData[i];
+            setMicLevel(Math.sqrt(sum / inputData.length));
+
             const pcmBlob = createPcmBlob(inputData);
-            sessionPromise.then(session => session.sendRealtimeInput({ media: pcmBlob }));
+            // CRITICAL: Initiate sendRealtimeInput after live.connect call resolves.
+            sessionPromise.then(session => {
+              if (session) session.sendRealtimeInput({ media: pcmBlob });
+            });
           };
           
           source.connect(scriptProcessor);
-          scriptProcessor.connect(audioContextInRef.current!.destination);
+          scriptProcessor.connect(contextIn.destination);
         } catch (err) {
           console.error("Mic access failed", err);
-          setStatus('IDLE');
+          stopSession();
         }
       },
       onmessage: async (message) => {
@@ -128,18 +172,22 @@ const LiveInterface: React.FC<LiveInterfaceProps> = ({ systemInstruction }) => {
         }
 
         const base64Audio = message.serverContent?.modelTurn?.parts?.find(p => p.inlineData)?.inlineData?.data;
-        if (base64Audio && audioContextOutRef.current) {
-          nextStartTimeRef.current = Math.max(nextStartTimeRef.current, audioContextOutRef.current.currentTime);
+        if (base64Audio && contextOut) {
+          // Schedule playback at the exact end time of the previous chunk
+          nextStartTimeRef.current = Math.max(nextStartTimeRef.current, contextOut.currentTime);
+          
           const audioBuffer = await decodeAudioData(
             decodeBase64(base64Audio),
-            audioContextOutRef.current,
+            contextOut,
             24000,
             1
           );
-          const source = audioContextOutRef.current.createBufferSource();
+          
+          const source = contextOut.createBufferSource();
           source.buffer = audioBuffer;
-          source.connect(audioContextOutRef.current.destination);
+          source.connect(contextOut.destination);
           source.start(nextStartTimeRef.current);
+          
           nextStartTimeRef.current += audioBuffer.duration;
           
           sourcesSetRef.current.add(source);
@@ -171,24 +219,24 @@ const LiveInterface: React.FC<LiveInterfaceProps> = ({ systemInstruction }) => {
         if (message.toolCall) {
           const functionResponses: any[] = [];
           for (const fc of message.toolCall.functionCalls) {
-            setTranscriptions(prev => [...prev, { role: 'tool', text: `Executing: ${fc.name}...` }]);
+            setTranscriptions(prev => [...prev, { role: 'tool', text: `Tool Exec: ${fc.name}` }]);
             
-            let result: any = { status: "ok" };
+            let result: any = { status: "success" };
             if (fc.name === 'get_weather') {
-              result = { status: "success", temperature: "22C", condition: "Partly Cloudy" };
-            } else if (fc.name === 'control_light') {
-              result = { status: "success", action: `Light set to ${fc.args.brightness}% brightness` };
+              result = { status: "success", temperature: "22°C", location: fc.args.location };
             }
 
             functionResponses.push({
               id: fc.id,
               name: fc.name,
-              response: { ...result, scheduling: "INTERRUPT" }
+              response: { result }
             });
           }
 
           if (functionResponses.length > 0) {
-            sessionPromise.then(session => session.sendToolResponse({ functionResponses }));
+            sessionPromise.then(session => {
+              if (session) session.sendToolResponse({ functionResponses });
+            });
           }
         }
 
@@ -202,15 +250,17 @@ const LiveInterface: React.FC<LiveInterfaceProps> = ({ systemInstruction }) => {
         }
 
         if (message.serverContent?.interrupted) {
-          sourcesSetRef.current.forEach(s => s.stop());
+          sourcesSetRef.current.forEach(s => {
+            try { s.stop(); } catch (e) {}
+          });
           sourcesSetRef.current.clear();
           nextStartTimeRef.current = 0;
           setCurrentThoughts("");
         }
       },
       onerror: (e) => {
-        console.error("Live Error", e);
-        setStatus('IDLE');
+        console.error("Live session encountered an error", e);
+        stopSession();
       },
       onclose: () => {
         setIsActive(false);
@@ -227,20 +277,6 @@ const LiveInterface: React.FC<LiveInterfaceProps> = ({ systemInstruction }) => {
     });
 
     sessionRef.current = await sessionPromise;
-  };
-
-  const stopSession = () => {
-    if (sessionRef.current) sessionRef.current.close();
-    if (frameIntervalRef.current) window.clearInterval(frameIntervalRef.current);
-    audioContextInRef.current?.close();
-    audioContextOutRef.current?.close();
-    audioContextInRef.current = null;
-    audioContextOutRef.current = null;
-    setIsActive(false);
-    setStatus('IDLE');
-    setResumptionHandle(null);
-    setTimeLeft(null);
-    setTokenInfo(null);
   };
 
   const toggleCamera = async () => {
@@ -261,9 +297,12 @@ const LiveInterface: React.FC<LiveInterfaceProps> = ({ systemInstruction }) => {
                 const reader = new FileReader();
                 reader.onloadend = () => {
                   const base64 = (reader.result as string).split(',')[1];
-                  sessionRef.current.sendRealtimeInput({
-                    media: { data: base64, mimeType: 'image/jpeg' }
-                  });
+                  // Send image frames to create a video conversation.
+                  if (sessionRef.current) {
+                    sessionRef.current.sendRealtimeInput({
+                      media: { data: base64, mimeType: 'image/jpeg' }
+                    });
+                  }
                 };
                 reader.readAsDataURL(blob);
               }
@@ -276,8 +315,12 @@ const LiveInterface: React.FC<LiveInterfaceProps> = ({ systemInstruction }) => {
     } else {
       if (videoRef.current?.srcObject) {
         (videoRef.current.srcObject as MediaStream).getTracks().forEach(t => t.stop());
+        videoRef.current.srcObject = null;
       }
-      if (frameIntervalRef.current) window.clearInterval(frameIntervalRef.current);
+      if (frameIntervalRef.current) {
+        window.clearInterval(frameIntervalRef.current);
+        frameIntervalRef.current = null;
+      }
       setIsCameraOn(false);
     }
   };
@@ -292,7 +335,7 @@ const LiveInterface: React.FC<LiveInterfaceProps> = ({ systemInstruction }) => {
     <div className="flex-1 flex flex-col md:flex-row bg-slate-950 overflow-hidden relative">
       <div className="flex-1 flex flex-col items-center justify-center p-8 relative">
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none overflow-hidden">
-          <div className={`w-[600px] h-[600px] rounded-full blur-[120px] transition-all duration-1000 ${status === 'LIVE' ? (useEphemeral ? 'bg-indigo-600/10 scale-150' : 'bg-blue-600/5 scale-150') : 'scale-50 opacity-0'}`} />
+          <div className={`w-[600px] h-[600px] rounded-full blur-[120px] transition-all duration-1000 ${status === 'LIVE' ? (useEphemeral ? 'bg-indigo-600/10' : 'bg-blue-600/5') : 'opacity-0'} scale-150`} />
         </div>
 
         <div className="relative w-full max-w-2xl flex flex-col items-center gap-10 z-10">
@@ -303,33 +346,24 @@ const LiveInterface: React.FC<LiveInterfaceProps> = ({ systemInstruction }) => {
               </div>
               {useEphemeral && status === 'LIVE' && (
                 <div className="px-3 py-1 bg-indigo-900/40 border border-indigo-400/30 rounded-full flex items-center gap-2">
-                   <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#818cf8" strokeWidth="3"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
+                   <div className="w-1 h-1 rounded-full bg-indigo-400 animate-pulse" />
                    <span className="text-[9px] font-bold text-indigo-400 uppercase tracking-widest">Ephemeral Security Active</span>
                 </div>
               )}
             </div>
             <h2 className="text-3xl font-bold tracking-tight text-white">Live Architect Interface</h2>
-            {timeLeft && (
-              <div className="mt-2 p-3 bg-red-900/20 border border-red-500/30 rounded-2xl flex items-center gap-3 animate-pulse">
-                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#ef4444" strokeWidth="2.5"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
-                <div className="text-left">
-                  <div className="text-[10px] font-bold text-red-400 uppercase tracking-widest">Connection Refresh</div>
-                  <div className="text-[9px] text-red-300 opacity-70">Server reset in: {timeLeft}</div>
-                </div>
-              </div>
-            )}
           </div>
 
           <div className="relative group">
-             <div className={`w-56 h-56 rounded-full border-2 flex items-center justify-center transition-all duration-700 shadow-2xl ${status === 'LIVE' ? (useEphemeral ? 'border-indigo-500/50 bg-indigo-500/5 shadow-indigo-500/20' : 'border-blue-500/50 bg-blue-500/5 shadow-blue-500/20') : 'border-slate-800 bg-slate-900 shadow-black'}`}>
-                <div className={`w-28 h-28 rounded-full transition-all duration-500 flex items-center justify-center ${status === 'LIVE' ? (useEphemeral ? 'bg-indigo-600 animate-pulse scale-110 shadow-[0_0_40px_rgba(79,70,229,0.4)]' : 'bg-blue-600 animate-pulse scale-110 shadow-[0_0_40px_rgba(37,99,235,0.4)]') : 'bg-slate-800 scale-100'}`}>
+             <div className={`w-56 h-56 rounded-full border-2 flex items-center justify-center transition-all duration-700 shadow-2xl ${status === 'LIVE' ? (useEphemeral ? 'border-indigo-500/50 bg-indigo-500/5' : 'border-blue-500/50 bg-blue-500/5') : 'border-slate-800 bg-slate-900 shadow-black'}`}>
+                <div 
+                  className={`w-28 h-28 rounded-full transition-all duration-300 flex items-center justify-center ${status === 'LIVE' ? (useEphemeral ? 'bg-indigo-600' : 'bg-blue-600') : 'bg-slate-800'}`}
+                  style={{ transform: `scale(${1 + micLevel * 2})` }}
+                >
                   <svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="23"></line><line x1="8" y1="23" x2="16" y2="23"></line></svg>
                 </div>
                 {status === 'LIVE' && (
-                  <>
-                    <div className={`absolute inset-0 rounded-full border animate-[spin_10s_linear_infinite] ${useEphemeral ? 'border-indigo-400/20' : 'border-blue-400/20'}`} />
-                    <div className={`absolute inset-4 rounded-full border animate-[spin_7s_linear_infinite_reverse] ${useEphemeral ? 'border-indigo-400/10' : 'border-blue-400/10'}`} />
-                  </>
+                  <div className={`absolute inset-0 rounded-full border-2 animate-ping opacity-20 ${useEphemeral ? 'border-indigo-400' : 'border-blue-400'}`} />
                 )}
              </div>
              {isCameraOn && (
@@ -342,8 +376,7 @@ const LiveInterface: React.FC<LiveInterfaceProps> = ({ systemInstruction }) => {
 
           <div className="flex flex-wrap items-center justify-center gap-4">
             {status === 'IDLE' ? (
-              <button onClick={startSession} className={`px-8 py-4 ${useEphemeral ? 'bg-indigo-600 hover:bg-indigo-700 shadow-indigo-900/30' : 'bg-blue-600 hover:bg-blue-700 shadow-blue-900/30'} text-white rounded-2xl font-bold flex items-center gap-3 transition-all active:scale-95 shadow-xl group`}>
-                <div className="w-2 h-2 rounded-full bg-white group-hover:animate-ping" />
+              <button onClick={startSession} className={`px-8 py-4 ${useEphemeral ? 'bg-indigo-600 hover:bg-indigo-700' : 'bg-blue-600 hover:bg-blue-700'} text-white rounded-2xl font-bold flex items-center gap-3 transition-all active:scale-95 shadow-xl group`}>
                 {resumptionHandle ? 'Resume Neural Link' : 'Secure Neural Handshake'}
               </button>
             ) : (
@@ -352,16 +385,12 @@ const LiveInterface: React.FC<LiveInterfaceProps> = ({ systemInstruction }) => {
                   Disconnect
                 </button>
                 <div className="flex gap-2 p-1.5 bg-slate-900 border border-slate-800 rounded-2xl">
-                   <LiveControlBtn 
-                     active={!isMuted} 
-                     onClick={() => setIsMuted(!isMuted)} 
-                     icon={isMuted ? <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="1" y1="1" x2="23" y2="23"></line><path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"></path><path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"></path><line x1="12" y1="19" x2="12" y2="23"></line><line x1="8" y1="23" x2="16" y2="23"></line></svg> : <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="23"></line><line x1="8" y1="23" x2="16" y2="23"></line></svg>} 
-                   />
-                   <LiveControlBtn 
-                     active={isCameraOn} 
-                     onClick={toggleCamera} 
-                     icon={<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path><circle cx="12" cy="13" r="4"></circle></svg>} 
-                   />
+                   <button onClick={() => setIsMuted(!isMuted)} className={`p-3 rounded-xl transition-all ${!isMuted ? 'bg-blue-600 text-white shadow-lg' : 'bg-slate-800 text-slate-500'}`}>
+                      {isMuted ? <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="1" y1="1" x2="23" y2="23"></line><path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"></path><path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"></path></svg> : <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path></svg>}
+                   </button>
+                   <button onClick={toggleCamera} className={`p-3 rounded-xl transition-all ${isCameraOn ? 'bg-blue-600 text-white shadow-lg' : 'bg-slate-800 text-slate-500'}`}>
+                      <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path><circle cx="12" cy="13" r="4"></circle></svg>
+                   </button>
                 </div>
               </>
             )}
@@ -397,10 +426,9 @@ const LiveInterface: React.FC<LiveInterfaceProps> = ({ systemInstruction }) => {
           </div>
         )}
         
-        <div ref={transcriptScrollRef} className="flex-1 overflow-y-auto p-4 space-y-6 scroll-smooth">
+        <div ref={transcriptScrollRef} className="flex-1 overflow-y-auto p-4 space-y-6 scroll-smooth custom-scrollbar">
           {transcriptions.length === 0 && !currentThoughts && (
             <div className="h-full flex flex-col items-center justify-center text-slate-600 text-[10px] uppercase font-bold text-center p-8 space-y-4">
-              <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="opacity-20"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
               Waiting for Neural Interaction
             </div>
           )}
@@ -415,7 +443,7 @@ const LiveInterface: React.FC<LiveInterfaceProps> = ({ systemInstruction }) => {
           ))}
 
           {currentThoughts && (
-            <div className="p-4 bg-amber-500/5 border border-amber-500/20 rounded-2xl animate-pulse">
+            <div className="p-4 bg-amber-500/5 border border-amber-500/20 rounded-2xl">
                <div className="flex items-center gap-2 mb-2">
                   <div className="w-1.5 h-1.5 rounded-full bg-amber-500" />
                   <span className="text-[9px] font-bold text-amber-500 uppercase tracking-widest">Model Reasoning</span>
@@ -426,22 +454,10 @@ const LiveInterface: React.FC<LiveInterfaceProps> = ({ systemInstruction }) => {
             </div>
           )}
         </div>
-        
-        <div className="p-4 border-t border-slate-800 text-[9px] text-slate-500 uppercase font-mono flex items-center gap-2">
-           <div className={`w-1.5 h-1.5 rounded-full ${status === 'LIVE' ? 'bg-green-500' : 'bg-slate-700'}`} />
-           Status: {status}
-           {resumptionHandle && <span className="ml-auto text-[8px] text-indigo-400">Resumable Handle Active</span>}
-        </div>
       </div>
     </div>
   );
 };
-
-const LiveControlBtn = ({ active, onClick, icon }: any) => (
-  <button onClick={onClick} className={`p-3 rounded-xl transition-all ${active ? 'bg-blue-600 text-white shadow-lg shadow-blue-900/20' : 'bg-slate-800 text-slate-500 hover:bg-slate-700'}`}>
-    {icon}
-  </button>
-);
 
 const LiveSettingToggle = ({ label, active, onClick }: { label: string, active: boolean, onClick: () => void }) => (
   <button onClick={onClick} className="flex items-center gap-2 group">
