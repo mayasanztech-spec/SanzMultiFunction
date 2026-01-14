@@ -1,0 +1,9 @@
+{
+  "name": "Gemini Text & Multimodal Architect",
+  "description": "A sophisticated playground for exploring Gemini 3's text generation, multimodal inputs, and advanced reasoning capabilities with real-time thinking and streaming.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "geolocation"
+  ]
+}
